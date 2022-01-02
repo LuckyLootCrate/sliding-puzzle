@@ -382,12 +382,12 @@ def main():
         }
     }
 
-    theme = 'dark'
+    theme = 'rock'
 
     config = {
         'enable_tile_numbers': True,
-        'enable_tile_borders': True,
-        'rounded_corners': True
+        'enable_tile_borders': False,
+        'rounded_corners': False
     }
 
     grid = Grid(width, height, tile_length, margin_x, margin_y, THEMES[theme], config)
