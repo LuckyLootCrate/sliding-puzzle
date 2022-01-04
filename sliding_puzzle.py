@@ -1,3 +1,4 @@
+import json
 import os
 from PIL import Image
 import pygame as pg
@@ -6,6 +7,24 @@ import random
 pg.init()
 pg.display.set_caption("Sliding Puzzle")
 
+def load_previous_state():
+    """Will load the game state from the previous solve, including the scrambled board state and moves made."""
+    
+    path = 'previous_state.json'
+
+    if not os.path.isfile(path):
+        return {'moves_made': None, 'scrambled_board': None}
+    else:
+        with open(path, 'r') as f:
+            return json.load(f)
+
+def save_current_state(state):
+    """This function will save the current state to a JSON file, including the initial scrambled board state and the moves made."""
+    
+    path = 'previous_state.json'
+    with open(path, 'w') as f:
+        json.dump(state, f, indent=4)
+    
 def crop(img, tiles_per_side):
     """Returns a list of cropped square tile images."""
     
@@ -21,6 +40,9 @@ def crop(img, tiles_per_side):
             tile = img.crop(box)
             tiles.append(tile)
     return tiles
+
+def copy_board(board):
+    return [[val for val in row] for row in board]
 
 def pilImageToSurface(pilImage):
     return pg.image.fromstring(
@@ -38,6 +60,10 @@ class Application:
     def reset(self):
         self.grid.reset()
         self.sidebar.reset()
+
+    def playback_reset(self):
+        self.grid.playback_reset()
+        self.sidebar.reset()
         
     def event_loop(self):
         for event in pg.event.get():
@@ -45,18 +71,40 @@ class Application:
                 self.quit()
 
             if event.type == pg.KEYDOWN:
-                if not self.grid.is_solved:
+                if not self.grid.has_won:
                     self.grid.make_move(event.key)
 
                 if event.key == pg.K_r:
                     self.reset()
                     self.grid.play_sfx('restart')
+
+                # Replay of the last game
+                if event.key == pg.K_p:
+                    self.grid.toggle_playback_mode()
+
+                    if self.grid.playback_mode:
+                        self.playback_reset()
+                        solve = self.grid.previous_state['moves_made']
+                        self.grid.load_playback_grid(solve)
+                        self.moves_to_preview = list(solve)
+                    else:
+                        self.reset()
+                        self.grid.play_sfx('restart')
+                        
                     
     def update(self, dt):
         self.grid.display()
         self.sidebar.display(dt)
 
-        if self.grid.is_solved:
+        if self.grid.playback_mode:
+            self.grid.grid_color = [128, 0, 0]
+            if len(self.moves_to_preview) > 0:
+                move = self.moves_to_preview.pop(0)
+                self.grid.make_move(move)
+            else:
+                self.grid.toggle_playback_mode()
+
+        elif self.grid.has_won:
             color = [random.randint(0, 255) for _ in range(3)]
             self.grid.grid_color = color
         else:
@@ -82,7 +130,12 @@ class Grid:
         self.width = width
         self.height = height
         self.tile_length = tile_length
+        
         self.empty_index = [width-1, height-1] # The index which starts
+        self.moves_made = ''
+        self.has_started = False
+        self.playback_mode = False
+        self.previous_state = load_previous_state() # Loads the JSON file for the previous game state for action replays
 
         # Offset from the edges of the screen
         self.margin_x = margin_x
@@ -96,38 +149,51 @@ class Grid:
         self.font = pg.font.SysFont(theme['font_name'], 30)
         self.sfx_mapping = self.load_sounds()
 
-        self.grid = self.get_new_grid(width, height)
-        self.has_started = False
-        self.moves_made = 0
-
-        # Load image if present
-        if theme['has_image']:
-            image_path = self.find_bg_image(self.theme['theme'])
-            chunks = self.get_image_chunks(image_path)
-            self.assign_image_chunks(chunks)
-
-        self.shuffle()
+        self.grid = self.initialise_grid()
+        self.scrambled_board = copy_board(self.grid)
         self.has_started = True
 
     def __repr__(self):
         return str(self.grid)
 
+    def __iter__(self):
+        return iter(self.grid)
+
     @property
-    def is_solved(self):
+    def has_won(self):
         """
-        Flatten a grid into a list of numbers and check if it is the same as a solved list.
-        i.e. converts something like [[1, 2], [3, None]] to [1, 2, 3, None]
+        Checks if the game is over, since all the tiles are in order
         """
         
-        return [tile.value for row in self.grid for tile in row][:-1] == list(map(str, range(1, self.width*self.height))) and self.has_started
+        return self.is_ordered_grid(self.get_tile_values(self.grid))
 
+    def is_ordered_grid(self, grid):
+        """Returns if a given grid is ordered. This only compares grids which comprise only of integers and strings. This will not accept Tile objects."""
+        
+        return grid == self.get_new_grid()
+
+    def get_tile_values(self, grid):
+        """This ensures that the the input grid is converted into a basic matrix of integers and strings, even if the input contains Tile objects or integers."""
+        res_grid = []
+        for row in grid:
+            res_row = []
+            for tile in row:
+                if isinstance(tile, Tile):
+                    res_row.append(tile.value)
+                else:
+                    res_row.append(tile)
+            res_grid.append(res_row)
+        return res_grid
+    
+    def convert_to_tiles(self, grid):
+        return [[Tile(i) for i in j] for j in grid]
+    
     def find_bg_image(self, folder):
         """Any image file which is named 'bg' becomes the background image for the puzzle."""
         
         for file in os.listdir(folder):
             name, ext = os.path.splitext(file)
             if name.lower() == 'bg':
-                print(os.path.join(folder, file))
                 return os.path.join(folder, file)
         
     def load_sounds(self):
@@ -145,29 +211,71 @@ class Grid:
             self.sfx_mapping[sfx].play()
             
     def reset(self):
+        """For restarting a new round afresh"""
         self.shuffle()
-        self.moves_made = 0
+        self.moves_made = ''
+        self.playback_mode = False
+
+    def playback_reset(self):
+        """For resetting the playback scene."""
+
+        self.empty_index = [self.width-1, self.height-1]
+        self.moves_made = ''
+
+    def load_playback_grid(self, solve):
+        """Function which loads the scrambled grid from the previous solve."""
+
+        self.grid = self.get_new_grid()
+        self.grid = self.process_grid(self.grid)
+        self.reverse_solve(solve)
+        
+    def toggle_playback_mode(self):
+        self.playback_mode = not self.playback_mode
 
     def get_image_chunks(self, path):
         img = Image.open(path)
         img = img.resize((self.width*self.tile_length, self.height*self.tile_length))
         return crop(img, self.width)
 
-    def assign_image_chunks(self, chunks):
-        for row in self.grid:
+    def assign_image_chunks(self, grid, chunks):
+        for row in grid:
             for tile in row:
                 if tile.value != '':
                     tile.img = pilImageToSurface(chunks.pop(0))
+
+    def process_image_bg(self, grid):
+        image_path = self.find_bg_image(self.theme['theme'])
+        chunks = self.get_image_chunks(image_path)
+        self.assign_image_chunks(grid, chunks)
                     
-
-    def get_new_grid(self, w, h):
+    def get_new_grid(self):
+        """Returns a grid containing integer elements. The empty space is represented as an empty string."""
+        
         grid = []
+        w, h = self.width, self.height
+        
         for i in range(1, w*h, w):
-            grid.append([Tile(str(j)) for j in range(i, i+w)])
-
+            grid.append([str(j) for j in range(i, i+w)])
+            
         # Replace the last element with an empty element
         x, y = self.empty_index
-        grid[y][x] = Tile('')
+        grid[y][x] = ''
+        return grid
+
+    def initialise_grid(self):
+        """Perform shuffle to the grid and convert each element to tile objects. This is used for starting a new game afresh."""
+
+        self.grid = self.get_new_grid()
+        self.grid = self.process_grid(self.grid)
+        self.shuffle()
+        return self.grid
+
+    def process_grid(self, grid):
+        """Function which loads a grid of scrambled integers and string and returns them in converted Tile format."""
+
+        grid = self.convert_to_tiles(grid)
+        if self.theme['has_image']:
+            self.process_image_bg(grid)
         return grid
 
     def is_index_in_bounds(self, x, y):
@@ -189,6 +297,24 @@ class Grid:
             pg.K_RIGHT: (x-1, y),
             pg.K_LEFT: (x+1, y)
         }
+
+        move_map = {
+            pg.K_UP: 'U',
+            pg.K_DOWN: 'D',
+            pg.K_RIGHT: 'R',
+            pg.K_LEFT: 'L',
+        }
+
+        letter_convert = {
+            'U': pg.K_UP,
+            'D': pg.K_DOWN,
+            'R': pg.K_RIGHT,
+            'L': pg.K_LEFT
+        }
+
+        # Convert letter moves to pygame inputs
+        if move in {'U', 'D', 'L', 'R'}:
+            move = letter_convert[move]
     
         # Swap with the neighbor
         if move in neighbors:
@@ -198,16 +324,36 @@ class Grid:
                 self.grid[y][x], self.grid[ny][nx] = self.grid[ny][nx], self.grid[y][x]
                 self.empty_index = [nx, ny]
 
+                # So that shuffling doesn't increase move count
+                if not shuffle:
+                    self.moves_made += move_map[move]
+
                 # Determine which sound to play
-                if self.is_solved:
+                if self.has_won and self.has_started:
                     self.play_sfx('win')
+                    self.save_state()
                 elif not shuffle:
                     self.play_sfx('move')
 
-                # So that shuffling doesn't increase move count
-                if not shuffle:
-                    self.moves_made += 1
-    
+    def save_state(self):
+        self.previous_state['moves_made'] = self.moves_made
+        self.previous_state['scrambled_board'] = self.get_tile_values(self.scrambled_board)
+        save_current_state(self.previous_state)
+
+    def reverse_solve(self, solve):
+        """Function which performs the inverse of the solved moves in order to tget the original scrambled state."""
+
+        inverse = {
+            'U': pg.K_DOWN,
+            'D': pg.K_UP,
+            'L': pg.K_RIGHT,
+            'R': pg.K_LEFT
+        }
+
+        res = ''
+        for move in reversed(solve):
+            self.make_move(inverse[move], shuffle=True)
+            
     def shuffle(self):
         """Will make 1000 random moves."""
 
@@ -248,6 +394,9 @@ class Tile:
     def __init__(self, value, img=None):
         self.value = value
         self.img = img
+
+    def __repr__(self):
+        return f"Tile({self.value})"
 
 class SideBar:
     def __init__(self, real_width, real_height, grid, theme):
@@ -292,7 +441,7 @@ class SideBar:
         axis = center + 50
         margin_y = 15
         self.display_text("Moves Made:", axis - margin_y)
-        self.display_text(str(self.grid.moves_made), axis + margin_y)
+        self.display_text(str(len(self.grid.moves_made)), axis + margin_y)
 
     def display_tips(self):
         axis = self.height - (self.height // 5) 
@@ -314,21 +463,22 @@ class SideBar:
     def format_milliseconds(self, milliseconds):
         seconds, milliseconds = divmod(milliseconds, 1000)
         minutes, seconds = divmod(seconds, 60)
-        return f"{minutes:02d}:{seconds:02d}:{milliseconds:03d}"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}:{milliseconds:03d}"
         
     def reset(self):
         self.timer = 0
 
     def timer_tick(self, dt):
-        if not self.grid.is_solved:
+        if not self.grid.has_won and not self.grid.playback_mode:
             self.timer += dt
            
 
 def main():
         
-    tile_length = 100
-    width = 6
-    height = 6
+    tile_length = 50
+    width = 10
+    height = 10
     sidebar_width = 200
     sidebar_height = height
 
@@ -382,7 +532,7 @@ def main():
         }
     }
 
-    theme = 'rock'
+    theme = 'hutao'
 
     config = {
         'enable_tile_numbers': True,
